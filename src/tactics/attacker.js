@@ -1,28 +1,35 @@
 /**
  * Attacker tactic — raids INACTIVE players only, espionage-gated.
  *
- * Safety rules (hard constraints):
- *  1. NEVER attack active players (only targets with [I] or [IM] status badge).
- *  2. MUST have a fresh espionage report before dispatching any fleet.
- *  3. Skip target if defence points exceed DEFENSE_SAFE_THRESHOLD.
- *  4. Skip target if report is missing or older than REPORT_MAX_AGE_H hours.
- *  5. Only attack if expected loot > fleet replacement cost.
+ * Full execution chain (automatic dependency resolution):
  *
- * Flow:
- *  1. Open Messages → Espionage Reports, collect viable targets.
- *  2. For each viable target, dispatch a small raid fleet.
- *  3. Log all decisions.
+ *  Phase 1 — PROBE (when no reports exist):
+ *    1. Scan nearby galaxy systems for planets with inactive status.
+ *    2. Send espionage probes to the closest inactives.
+ *    3. Log "probing N targets — check next cycle".
+ *
+ *  Phase 2 — ATTACK (next cycle, when reports are available):
+ *    1. Read espionage reports from messages.
+ *    2. Filter: inactive badge, defense < threshold, loot > fleet cost.
+ *    3. Dispatch Light Fighters to viable targets.
+ *
+ * Safety rules (hard constraints, never overridden):
+ *  - NEVER attack active players.
+ *  - NEVER attack if defense > DEFENSE_SAFE_THRESHOLD.
+ *  - Skip report if older than REPORT_MAX_AGE_H hours.
+ *  - Skip if expected loot < fleet replacement cost × MIN_PROFIT_RATIO.
  */
 
 const logger = require('../utils/logger');
-const { humanDelay, thinkTime, delay } = require('../utils/delay');
+const { humanDelay, thinkTime } = require('../utils/delay');
 const { gotoComponent, readResources, withRetry, BASE_URL } = require('../utils/navigation');
-const { humanClickSelector, humanClick } = require('../utils/human');
-const { findElementWithAI, analyzeTarget } = require('../ai/analyst');
 
 const DEFENSE_SAFE_THRESHOLD = parseInt(process.env.DEFENSE_SAFE_THRESHOLD ?? '5000', 10);
 const ESPIONAGE_MIN_LEVEL    = parseInt(process.env.ESPIONAGE_MIN_LEVEL    ?? '5',    10);
-const REPORT_MAX_AGE_H       = 6;   // ignore reports older than 6 hours
+const REPORT_MAX_AGE_H       = 6;    // ignore reports older than 6 hours
+const PROBE_RANGE            = 4;    // scan ±N systems around home for inactives
+const MAX_PROBES_PER_CYCLE   = 6;    // max probe dispatches in one cycle
+const PROBES_PER_TARGET      = Math.max(ESPIONAGE_MIN_LEVEL, 3); // probes to send per target
 
 // Minimum loot-to-fleet-cost ratio before attacking
 const MIN_PROFIT_RATIO = 1.5;
@@ -110,14 +117,11 @@ async function parseReport(page, reportEl) {
 }
 
 async function shouldAttackTarget(target) {
-  // Hard rules first (no AI needed)
+  // Hard rules — no AI needed, saves tokens
   if (target.defensePoints > DEFENSE_SAFE_THRESHOLD) return false;
   if (target.reportAge > REPORT_MAX_AGE_H) return false;
   if (target.totalLoot < LF_COST.metal * MIN_PROFIT_RATIO) return false;
-
-  // AI second opinion
-  const aiDecision = await analyzeTarget(target);
-  return aiDecision.attack;
+  return true;
 }
 
 function parseReportAge(timeText) {
@@ -142,7 +146,172 @@ async function extractStat(el, selectors) {
   return 0;
 }
 
-// ── Fleet dispatch ────────────────────────────────────────────────────────────
+// ── Galaxy scanner for inactive planets ──────────────────────────────────────
+
+/**
+ * Scan a single OGame system for inactive players.
+ * Returns an array of coord strings "G:S:P" (inactive or inactive-long only).
+ */
+async function scanSystemForInactives(page, galaxy, system) {
+  const url = `${BASE_URL}/game/index.php?page=ingame&component=galaxy&galaxy=${galaxy}&system=${system}`;
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await humanDelay(600, 1200);
+
+  return page.evaluate(() => {
+    const results = [];
+    const galaxyVal = document.querySelector('#galaxy_input, [name="galaxy"]')?.value
+      || new URLSearchParams(location.search).get('galaxy');
+    const systemVal = document.querySelector('#system_input, [name="system"]')?.value
+      || new URLSearchParams(location.search).get('system');
+    if (!galaxyVal || !systemVal) return results;
+
+    // Each position row — OGame uses tr.row or table rows with a position cell
+    document.querySelectorAll('table#galaxytable tr[data-pos], table#galaxytable tr.row').forEach(row => {
+      // Position: data-pos attr, or first td text
+      const pos = row.dataset?.pos || row.querySelector('td.position')?.innerText?.trim();
+      if (!pos || isNaN(Number(pos))) return;
+
+      // Inactive detection: player status cell gets class inactive / longinactive / playerInactive
+      const playerCell = row.querySelector('td.playername, td.player');
+      if (!playerCell) return;
+      const hasInactive = playerCell.classList.contains('inactive')
+        || playerCell.classList.contains('longinactive')
+        || playerCell.classList.contains('playerInactive')
+        || !!playerCell.querySelector('.inactive, .longinactive, [class*="inactive"]')
+        // Some OGame skins put [I] or [IM] text next to the name
+        || /\[i\]/i.test(playerCell.innerText);
+
+      if (hasInactive) {
+        results.push(`${galaxyVal}:${systemVal}:${pos}`);
+      }
+    });
+    return results;
+  });
+}
+
+/**
+ * Scan PROBE_RANGE systems around homeCoords for inactive planets.
+ * Returns candidates sorted by distance (nearest first), capped at MAX_PROBES_PER_CYCLE.
+ */
+async function findNearbyInactives(page, homeCoords) {
+  const [g, sys] = homeCoords.replace(/[\[\]]/g, '').split(':').map(Number);
+  if (!g || !sys) return [];
+
+  const candidates = [];
+  const MAX_SYSTEMS = 499;
+
+  for (let offset = 0; offset <= PROBE_RANGE; offset++) {
+    const systemsToScan = offset === 0
+      ? [sys]
+      : [...new Set([Math.max(1, sys - offset), Math.min(MAX_SYSTEMS, sys + offset)])];
+
+    for (const s of systemsToScan) {
+      try {
+        const inactives = await scanSystemForInactives(page, g, s);
+        for (const coords of inactives) {
+          candidates.push({ coords, distance: Math.abs(s - sys) });
+        }
+        await humanDelay(300, 700);
+      } catch (err) {
+        logger.debug(`[Attacker] Galaxy scan ${g}:${s} error: ${err.message}`);
+      }
+    }
+
+    if (candidates.length >= MAX_PROBES_PER_CYCLE) break;
+  }
+
+  candidates.sort((a, b) => a.distance - b.distance);
+  return candidates.slice(0, MAX_PROBES_PER_CYCLE);
+}
+
+// ── Probe dispatch ────────────────────────────────────────────────────────────
+
+/**
+ * Send PROBES_PER_TARGET espionage probes to the given coords.
+ * Returns true if dispatch succeeded.
+ */
+async function dispatchProbe(page, coords) {
+  logger.info(`[Attacker] 🔭 Probing ${coords}`);
+
+  await gotoComponent(page, 'fleetdispatch');
+  await thinkTime();
+
+  // Espionage Probe = tech id 210
+  const probeInput = await page.$('[data-technology="210"] input, #ship_210');
+  if (!probeInput) {
+    logger.warn('[Attacker] No espionage probes available in hangar');
+    return false;
+  }
+
+  await probeInput.scrollIntoViewIfNeeded();
+  await humanDelay(300, 600);
+  await probeInput.click({ clickCount: 3 });
+  await probeInput.fill(String(PROBES_PER_TARGET));
+  await humanDelay(400, 800);
+
+  // Continue to target selection
+  const continueBtn = await page.$('#continue, button.continue, .continue-btn, button[data-step="2"]');
+  if (!continueBtn) { logger.warn('[Attacker] Probe: continue button not found'); return false; }
+  await continueBtn.scrollIntoViewIfNeeded();
+  await humanDelay(400, 900);
+  await continueBtn.click();
+  await humanDelay(900, 1600);
+
+  // Fill coordinates
+  const [galaxy, system, position] = coords.split(':');
+  await fillCoord(page, '#galaxy, [name="galaxy"]', galaxy);
+  await fillCoord(page, '#system, [name="system"]', system);
+  await fillCoord(page, '#position, [name="position"]', position);
+  await humanDelay(400, 800);
+
+  // Select mission 6 = Espionage
+  const missionBtn = await page.$('[name="mission"][value="6"], #missionButton6, label[for*="mission6"]');
+  if (missionBtn) {
+    await humanDelay(300, 500);
+    await missionBtn.click();
+    await humanDelay(400, 700);
+  }
+
+  // Second continue
+  const continueBtn2 = await page.$('#continue, button.continue, button[data-step="3"]');
+  if (continueBtn2) {
+    await continueBtn2.click();
+    await humanDelay(800, 1400);
+  }
+
+  // Send
+  const sendBtn = await page.$('#sendFleet, button.sendFleet, .sendFleet, button[data-step="send"]');
+  if (!sendBtn) { logger.warn(`[Attacker] Probe to ${coords}: send button not found`); return false; }
+  await sendBtn.scrollIntoViewIfNeeded();
+  await humanDelay(500, 1000);
+  await sendBtn.click();
+
+  logger.info(`[Attacker] ✅ Probe dispatched → ${coords}`);
+  return true;
+}
+
+/**
+ * Probe nearby inactive planets when we have no espionage reports.
+ * Returns the number of probes successfully sent.
+ */
+async function probeNearbyInactives(page, homeCoords) {
+  logger.info(`[Attacker] 🗺️  Scanning galaxy for inactive targets near ${homeCoords}…`);
+  const candidates = await findNearbyInactives(page, homeCoords);
+
+  if (!candidates.length) {
+    logger.info('[Attacker] No inactive planets found in nearby systems');
+    return 0;
+  }
+
+  logger.info(`[Attacker] Found ${candidates.length} inactive planet(s) — dispatching probes`);
+  let sent = 0;
+  for (const { coords } of candidates) {
+    const ok = await dispatchProbe(page, coords);
+    if (ok) sent++;
+    await humanDelay(800, 1500);
+  }
+  return sent;
+}
 
 /**
  * Calculate how many Light Fighters are needed to carry max loot.
@@ -247,40 +416,61 @@ async function collectTargets(page) {
 
 /**
  * Dispatch raids from the CURRENT planet toward pre-collected targets.
- * Pass targets collected by collectTargets() so messages aren't re-read per planet.
+ *
+ * opts.targets      — viable targets from collectTargets() (already read this cycle)
+ * opts.homeCoords   — "G:S:P" of the home/current planet (used if probing is needed)
+ * opts.preferNearby — hint from player directive (ignored in probe phase)
  */
-async function run(page, targets = null) {
+async function run(page, opts = {}) {
   logger.info('━━ [Attacker] tactic start ━━');
 
   try {
-    const viableTargets = targets ?? await collectTargets(page);
+    // opts can be passed as raw array (legacy) or opts object
+    const viableTargets = Array.isArray(opts) ? opts : (opts.targets ?? []);
+    const homeCoords    = opts.homeCoords ?? null;
 
-    if (!viableTargets.length) {
-      logger.info('[Attacker] No viable targets from espionage reports');
+    // ── PHASE 2: Attack from existing reports ─────────────────────────────────
+    if (viableTargets.length) {
+      viableTargets.sort((a, b) => b.totalLoot - a.totalLoot);
+      const resources = await readResources(page);
+
+      for (const target of viableTargets) {
+        const lfCount = calcFleet(target.totalLoot);
+        const cost    = fleetCost(lfCount);
+        const fleetCostEquiv = cost.metal + cost.crystal * 1.5;
+        const profitRatio    = target.totalLoot / (fleetCostEquiv || 1);
+
+        if (profitRatio < MIN_PROFIT_RATIO) {
+          logger.info(`[Attacker] ${target.coords} — ratio ${profitRatio.toFixed(2)} < ${MIN_PROFIT_RATIO}, skipping`);
+          continue;
+        }
+        if (resources.metal < cost.metal || resources.crystal < cost.crystal) {
+          logger.info(`[Attacker] ${target.coords} — can't cover fleet cost, skipping`);
+          continue;
+        }
+
+        logger.info(`[Attacker] 🎯 Target ${target.coords}: loot≈${Math.round(target.totalLoot)} def=${target.defensePoints}`);
+        await dispatchFleet(page, target, lfCount);
+        await humanDelay(800, 1500);
+      }
+      logger.info('━━ [Attacker] tactic end ━━');
       return;
     }
 
-    viableTargets.sort((a, b) => b.totalLoot - a.totalLoot);
-    const resources = await readResources(page);
+    // ── PHASE 1: No reports — scan galaxy and probe inactive planets ──────────
+    if (!homeCoords) {
+      logger.info('[Attacker] No reports and no home coords — cannot probe, skipping');
+      logger.info('━━ [Attacker] tactic end ━━');
+      return;
+    }
 
-    for (const target of viableTargets) {
-      const lfCount = calcFleet(target.totalLoot);
-      const cost    = fleetCost(lfCount);
-      const fleetCostEquiv = cost.metal + cost.crystal * 1.5;
-      const profitRatio    = target.totalLoot / (fleetCostEquiv || 1);
+    logger.info('[Attacker] No espionage reports found — initiating probe phase');
+    const probesSent = await probeNearbyInactives(page, homeCoords);
 
-      if (profitRatio < MIN_PROFIT_RATIO) {
-        logger.info(`[Attacker] ${target.coords} — ratio ${profitRatio.toFixed(2)} < ${MIN_PROFIT_RATIO}, skipping`);
-        continue;
-      }
-      if (resources.metal < cost.metal || resources.crystal < cost.crystal) {
-        logger.info(`[Attacker] ${target.coords} — can't cover fleet cost, skipping`);
-        continue;
-      }
-
-      logger.info(`[Attacker] Target ${target.coords}: loot≈${Math.round(target.totalLoot)} def=${target.defensePoints}`);
-      await dispatchFleet(page, target, lfCount);
-      await humanDelay(800, 1500);
+    if (probesSent > 0) {
+      logger.info(`[Attacker] 📡 ${probesSent} probe(s) dispatched — reports will be ready next cycle`);
+    } else {
+      logger.info('[Attacker] No suitable inactive targets found nearby — will retry next cycle');
     }
   } catch (err) {
     logger.error(`[Attacker] Error: ${err.message}`);

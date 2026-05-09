@@ -244,6 +244,9 @@ async function runCycle(page) {
 
     const directiveParams = (!directiveBlocked && directiveInterpretation?.params) ? directiveInterpretation.params : {};
 
+    // Home planet coords — used by attacker to know which area to probe
+    const homePlanet = snapshots.find(s => s.planet.isHome) ?? snapshots[0];
+
     for (const tactic of tacticFilter) {
       const opts = {
         includeResearch:     isHome,
@@ -253,6 +256,7 @@ async function runCycle(page) {
         snapshot:            snap,
         totalPlanets:        planets.length,
         targets:             tactic === 'attacker' ? raidTargets : undefined,
+        homeCoords:          tactic === 'attacker' ? (homePlanet?.planet?.coords ?? planet.coords) : undefined,
         preferNearby:        directiveParams.preferNearby,
         aggressiveness:      directiveParams.aggressiveness,
       };
