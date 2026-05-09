@@ -63,275 +63,294 @@ async function maybeDistract(probability = 0.05) {
 // ── Empire page scraper ────────────────────────────────────────────────────────
 
 /**
- * Navigate to the empire standalone page, then scrape ALL planet data.
+ * Scrape the empire table that is currently visible in the #empire container.
+ * Called once per tab. Returns { planets[], data{} } or null.
+ */
+async function _scrapeVisibleEmpireTab(page) {
+  return page.evaluate(() => {
+    const parseNum = (text) =>
+      parseInt(String(text || '0').replace(/[^0-9-]/g, ''), 10) || 0;
+
+    const container = document.querySelector('#empire, #empireComponent');
+    if (!container) return null;
+
+    const table = container.querySelector('table');
+    if (!table) return null;
+
+    // ── Planet headers (first <tr> in thead or whole table) ──────────────────
+    const headerRow = table.querySelector('thead tr, tr:first-child');
+    if (!headerRow) return null;
+
+    const headerCells = Array.from(headerRow.querySelectorAll('th, td'));
+    // Column 0 is always the label column; planets start at index 1
+    const planetHeaders = [];
+    for (let i = 1; i < headerCells.length; i++) {
+      const cell  = headerCells[i];
+      const text  = cell.innerText ?? '';
+      const name  = cell.querySelector('[class*="name"], h3, h4, span')?.innerText?.trim()
+                    || text.split('\n')[0]?.trim()
+                    || `Planet ${i}`;
+      const coords = text.match(/\[\d+:\d+:\d+\]/)?.[0]
+                     || cell.querySelector('[class*="coord"], [class*="koord"]')?.innerText?.trim()
+                     || '';
+      const planetId = cell.dataset?.planetId
+                       || cell.querySelector('[data-planet-id]')?.dataset?.planetId
+                       || String(i);
+      const isMoon = name.toLowerCase().includes('moon')
+                     || !!cell.querySelector('[class*="moon"]');
+      planetHeaders.push({ colIdx: i - 1, name, coords, planetId, isMoon });
+    }
+
+    if (planetHeaders.length === 0) return null;
+
+    // ── Technology rows ───────────────────────────────────────────────────────
+    const rows = table.querySelectorAll('tbody tr[data-technology], tbody tr');
+    const data = {};   // keyed by planet column index
+
+    rows.forEach(row => {
+      const techId = row.getAttribute('data-technology') || row.dataset?.technology;
+      if (!techId) return;
+
+      const cells = Array.from(row.querySelectorAll('td'));
+      planetHeaders.forEach((planet, pi) => {
+        const cell = cells[pi + 1];
+        if (!cell) return;
+
+        if (!data[pi]) {
+          data[pi] = {
+            ...planet,
+            buildings: {}, fleet: {}, defense: {}, resources: {}, energy: 0,
+          };
+        }
+
+        const val = parseNum(
+          cell.getAttribute('data-value') ?? cell.dataset?.value ?? cell.innerText
+        );
+        const tid = Number(techId);
+
+        // Resource pseudo-IDs used in empire view
+        if (techId === '901')      data[pi].resources.metal      = val;
+        else if (techId === '902') data[pi].resources.crystal    = val;
+        else if (techId === '903') data[pi].resources.deuterium  = val;
+        else if (techId === '904') data[pi].energy               = val;
+        // Fleet (200–399), Defense (400–499), everything else = buildings
+        else if (tid >= 400 && tid < 500) data[pi].defense[techId]   = val;
+        else if (tid >= 200 && tid < 400) data[pi].fleet[techId]     = val;
+        else if (val > 0)                 data[pi].buildings[techId] = val;
+      });
+    });
+
+    return { planets: planetHeaders, data };
+  }).catch(() => null);
+}
+
+/**
+ * Merge one tab's scrape result into the running mergedData map.
+ * mergedData is keyed by planet coords (or planetId as fallback).
+ */
+function _mergeTabData(mergedData, tabResult) {
+  if (!tabResult) return;
+  const { planets, data } = tabResult;
+  planets.forEach((planet, pi) => {
+    const key = planet.coords || planet.planetId;
+    if (!mergedData[key]) {
+      mergedData[key] = {
+        ...planet,
+        buildings: {}, fleet: {}, defense: {}, resources: {}, energy: 0,
+      };
+    }
+    const src = data[pi];
+    if (!src) return;
+    Object.assign(mergedData[key].buildings, src.buildings);
+    Object.assign(mergedData[key].fleet,     src.fleet);
+    Object.assign(mergedData[key].defense,   src.defense);
+    Object.assign(mergedData[key].resources, src.resources);
+    if (src.energy) mergedData[key].energy = src.energy;
+  });
+}
+
+/**
+ * Navigate to the empire standalone page, click through each tab so AJAX
+ * content loads, and collect full planet snapshots.
  *
- * The empire view (page=standalone&component=empire) renders every planet as a
- * column of tech rows. We collect all data in one scrollable view.
+ * OGame's empire page loads content LAZILY per tab (#empireTab).
+ * Without clicking each tab, [data-technology] elements never appear.
  *
- * Also tries ?page=ingame&component=empire if the standalone URL redirects.
- *
- * Returns an array of snapshots, or null if the page is unavailable / parsing fails.
+ * Returns an array of snapshots, or null to trigger the per-planet fallback.
  */
 async function scanViaEmpirePage(page, planets) {
   try {
     logger.info('[Scanner] Loading Empire overview page …');
 
-    // Occasionally visit the overview first to vary the entry point
+    // Occasionally visit overview first for variety
     if (Math.random() < 0.25) {
       await goto(page, `${BASE_URL}/game/index.php?page=ingame&component=overview`);
       await humanDelay(800, 2000);
     }
 
     await goto(page, `${BASE_URL}/game/index.php?page=standalone&component=empire`);
-
-    // Human behaviour: read the page, scroll a bit — NO tab clicks (they navigate away)
-    await humanDelay(1200, 3000);
-    await maybeScroll(page, 0.6);
-    await maybeDistract(0.08);
+    await humanDelay(1200, 2500);
 
     let currentUrl = page.url();
     logger.debug(`[Scanner] Empire URL after load: ${currentUrl}`);
 
-    // The game sometimes redirects standalone → ingame. Both are fine as long as
-    // 'empire' is still in the component.
     if (!currentUrl.includes('empire')) {
-      // Last resort: try ingame variant
       logger.warn(`[Scanner] Empire page redirected to: ${currentUrl} — trying ingame variant`);
       await goto(page, `${BASE_URL}/game/index.php?page=ingame&component=empire`);
       await humanDelay(1000, 2000);
       currentUrl = page.url();
       if (!currentUrl.includes('empire')) {
-        logger.warn(`[Scanner] Ingame empire also redirected to: ${currentUrl} — falling back`);
+        logger.warn(`[Scanner] Ingame empire also redirected — falling back`);
         return null;
       }
     }
 
-    // Scroll through the full page so lazy-loaded content appears
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2)).catch(() => {});
-    await humanDelay(400, 800);
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-    await humanDelay(400, 800);
-    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
-    await humanDelay(300, 600);
+    // Wait for the empire component to be present in DOM
+    const empireEl = await page.waitForSelector(
+      '#empireComponent, #empire, [id*="empire"]',
+      { timeout: 12000 }
+    ).catch(() => null);
 
-    // ── DOM extraction ───────────────────────────────────────────────────────
-    const empireData = await page.evaluate(() => {
-      /**
-       * The empire page renders a wide table:
-       *   - <thead> rows contain planet name + coords per column
-       *   - <tbody> rows are keyed by data-technology, values per column
-       *
-       * Selector priority:
-       *   1. Table-based layout (most OGame versions)
-       *   2. Card/column layout (some alternate skins)
-       *   3. Flat data-technology + data-planet-id scan (fallback)
-       */
-
-      const parseNum = (text) =>
-        parseInt(String(text || '0').replace(/[^0-9-]/g, ''), 10) || 0;
-
-      // ── Strategy 1: table-based layout ───────────────────────────────────
-      // OGame uses various class/ID combos across versions
-      const table = document.querySelector([
-        '#empiretable table',
-        '#empiretable',
-        '.empire-overview table',
-        '.empiretable table',
-        '.empiretable',
-        '#empire table',
-        'table.empiretable',
-        '.empire table',
-        '#main table.table',
-        '.content-box table',
-      ].join(', '));
-
-      if (table && table.tagName === 'TABLE') {
-        // Detect planet columns from header row
-        const headerRow = table.querySelector('thead tr, tr:first-child');
-        if (headerRow) {
-          const headerCells = Array.from(headerRow.querySelectorAll('th, td'));
-          // First column is the label column; planet columns start at index 1
-          const planets = [];
-          for (let i = 1; i < headerCells.length; i++) {
-            const cell = headerCells[i];
-            const name   = cell.querySelector('.planet-name, .name, h3, h4, .planetname')?.innerText?.trim() ||
-                           cell.innerText?.split('\n')[0]?.trim() || `Planet ${i}`;
-            const coords = cell.querySelector('.planet-koords, .coords, .coordinates, .koords')?.innerText?.trim() ||
-                           cell.innerText?.match(/\[\d+:\d+:\d+\]/)?.[0] || '';
-            const planetId = cell.querySelector('[data-planet-id]')?.dataset?.planetId ||
-                             cell.dataset?.planetId || String(i);
-            const isMoon = name.toLowerCase().includes('moon') ||
-                           cell.querySelector('.moon, [class*="moon"]') !== null;
-            planets.push({ idx: i - 1, name, coords, planetId, isMoon,
-                           resources: {}, energy: 0, buildings: {}, fleet: {}, defense: {} });
-          }
-
-          if (planets.length > 0) {
-            // Parse each data row
-            const dataRows = table.querySelectorAll('tbody tr, tr[data-technology]');
-            dataRows.forEach(row => {
-              const techId = row.dataset?.technology || row.getAttribute('data-technology');
-              const cells  = Array.from(row.querySelectorAll('td'));
-              planets.forEach((planet, pi) => {
-                const cell = cells[pi + 1];
-                if (!cell) return;
-                const val = parseNum(cell.dataset?.value ?? cell.getAttribute('data-value') ?? cell.innerText);
-                if (!techId) return;
-                if (techId === '901') planet.resources.metal      = val;
-                else if (techId === '902') planet.resources.crystal   = val;
-                else if (techId === '903') planet.resources.deuterium = val;
-                else if (techId === '904') planet.energy               = val;
-                else if (Number(techId) >= 400 && Number(techId) < 500) planet.defense[techId] = val;
-                else if (Number(techId) >= 200 && Number(techId) < 400) planet.fleet[techId]   = val;
-                else if (val > 0 || cell.innerText.trim() !== '')        planet.buildings[techId] = val;
-              });
-            });
-
-            return { layout: 'table', planets };
-          }
-        }
-      }
-
-      // ── Strategy 2: card/column layout ───────────────────────────────────
-      const planetCards = document.querySelectorAll([
-        '.planet-overview',
-        '.empire-planet',
-        '[class*="empire"] [class*="planet"]',
-        '.planetInfo',
-        '.planet-col',
-        '.empire-col',
-      ].join(', '));
-
-      if (planetCards.length > 0) {
-        const planets = [];
-        planetCards.forEach((card, idx) => {
-          const name   = card.querySelector('.planet-name, .name, h3, h4, .planetname')?.innerText?.trim() || `Planet ${idx + 1}`;
-          const coords = card.querySelector('.planet-koords, .coords, .coordinates, .koords')?.innerText?.trim() ||
-                         card.innerText?.match(/\[\d+:\d+:\d+\]/)?.[0] || '';
-          const isMoon = name.toLowerCase().includes('moon') ||
-                         card.querySelector('.moon, [class*="moon"]') !== null;
-          const snap   = { idx, name, coords, isMoon, resources: {}, energy: 0, buildings: {}, fleet: {}, defense: {} };
-
-          card.querySelectorAll('[data-technology]').forEach(el => {
-            const techId = el.getAttribute('data-technology');
-            const valEl  = el.querySelector('.amount, .data_value, .level strong, .value');
-            const val    = parseNum(valEl?.innerText ?? el.dataset?.value ?? el.innerText);
-            if (!techId) return;
-            if (Number(techId) >= 400 && Number(techId) < 500) snap.defense[techId] = val;
-            else if (Number(techId) >= 200 && Number(techId) < 400) snap.fleet[techId] = val;
-            else snap.buildings[techId] = val;
-          });
-
-          const resBar = card.querySelector('#resources_metal, .metal .value, [id*="metal"]');
-          if (resBar) {
-            snap.resources.metal     = parseNum(resBar.dataset?.raw ?? resBar.innerText);
-            snap.resources.crystal   = parseNum(card.querySelector('#resources_crystal, .crystal .value')?.dataset?.raw ?? card.querySelector('#resources_crystal, .crystal .value')?.innerText);
-            snap.resources.deuterium = parseNum(card.querySelector('#resources_deuterium, .deuterium .value')?.dataset?.raw ?? card.querySelector('#resources_deuterium, .deuterium .value')?.innerText);
-          }
-
-          planets.push(snap);
-        });
-
-        if (planets.length > 0) return { layout: 'cards', planets };
-      }
-
-      // ── Strategy 3: flat data-technology scan with data-planet grouping ──
-      const grouped = {};
-      document.querySelectorAll('[data-technology][data-planet-id]').forEach(el => {
-        const techId   = el.getAttribute('data-technology');
-        const planetId = el.getAttribute('data-planet-id');
-        const val = parseNum(
-          el.querySelector('.amount, .data_value, .level strong')?.innerText ??
-          el.dataset?.value ?? el.innerText
-        );
-        if (!grouped[planetId]) grouped[planetId] = { planetId, buildings: {}, fleet: {}, defense: {}, resources: {}, energy: 0 };
-        const snap = grouped[planetId];
-        if (Number(techId) >= 400 && Number(techId) < 500) snap.defense[techId]   = val;
-        else if (Number(techId) >= 200 && Number(techId) < 400) snap.fleet[techId] = val;
-        else snap.buildings[techId] = val;
-      });
-
-      const flatPlanets = Object.values(grouped);
-      if (flatPlanets.length > 0) return { layout: 'flat', planets: flatPlanets };
-
+    if (!empireEl) {
+      logger.warn('[Scanner] Empire component never appeared in DOM — falling back');
       return null;
+    }
+
+    await humanDelay(400, 800);
+
+    // ── Discover tabs ─────────────────────────────────────────────────────────
+    // #empireTab contains links/buttons that trigger AJAX content loading per
+    // category (Buildings, Research, Fleet, Defense, Resources).
+    // Each tab either navigates to a URL with a category param, or fires JS.
+    const tabInfo = await page.evaluate(() => {
+      const container = document.querySelector('#empireTab');
+      if (!container) return [];
+      return Array.from(container.querySelectorAll('a, button')).map((el, i) => ({
+        index:    i,
+        text:     el.innerText.trim(),
+        href:     el.getAttribute('href') || '',
+        tagName:  el.tagName.toLowerCase(),
+        selector: el.id ? `#${el.id}` : `#empireTab a:nth-of-type(${i + 1})`,
+      }));
     });
 
-    if (!empireData || !empireData.planets || empireData.planets.length < 2) {
-      // Rich DOM diagnostic to help identify real selectors on next failure
-      const domHint = await page.evaluate(() => {
-        const title = document.title;
-        // Find any empire-related elements
-        const empireEls = Array.from(document.querySelectorAll('[id*="empire"],[class*="empire"]'))
-          .slice(0, 10)
-          .map(e => `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''}${e.className ? '.' + String(e.className).trim().split(/\s+/).slice(0, 3).join('.') : ''}`);
-        // Any data-technology elements (should be present on empire page)
-        const techCount = document.querySelectorAll('[data-technology]').length;
-        const planetIdCount = document.querySelectorAll('[data-planet-id]').length;
-        // Tables
-        const tables = Array.from(document.querySelectorAll('table'))
-          .slice(0, 5)
-          .map(t => `table${t.id ? '#' + t.id : ''}${t.className ? '.' + String(t.className).split(/\s+/)[0] : ''} (${t.rows.length}rows)`);
-        // Error messages
-        const errorEl = document.querySelector('.error, .alert, #error');
-        return {
-          title,
-          url: location.href,
-          empireEls,
-          techCount,
-          planetIdCount,
-          tables,
-          error: errorEl?.innerText?.slice(0, 100) ?? null,
-        };
-      }).catch(e => ({ evalError: e.message }));
+    logger.debug(`[Scanner] Tabs found: ${tabInfo.map(t => `"${t.text}"(${t.href || 'js'})`).join(', ')}`);
 
-      logger.warn(`[Scanner] Empire parse failed — got ${empireData?.planets?.length ?? 0} planets`);
-      logger.warn(`[Scanner] DOM diagnostic: title="${domHint.title}" techElements=${domHint.techCount} planetIdElements=${domHint.planetIdCount}`);
-      if (domHint.empireEls?.length) logger.warn(`[Scanner] Empire elements: ${domHint.empireEls.join(' | ')}`);
-      if (domHint.tables?.length)    logger.warn(`[Scanner] Tables: ${domHint.tables.join(' | ')}`);
-      if (domHint.error)             logger.warn(`[Scanner] Page error: ${domHint.error}`);
+    const mergedData = {};
+
+    if (tabInfo.length === 0) {
+      // No tabs — maybe content is already rendered (some OGame versions)
+      logger.debug('[Scanner] No tabs found — attempting direct scrape');
+      _mergeTabData(mergedData, await _scrapeVisibleEmpireTab(page));
+    } else {
+      for (const tab of tabInfo) {
+        // Determine whether this is a navigable URL or a JS-only tab
+        const isNavigable = tab.href && tab.href !== '#'
+          && !tab.href.startsWith('javascript')
+          && tab.href !== currentUrl;
+
+        if (isNavigable) {
+          // Navigate directly to the tab URL
+          const fullUrl = tab.href.startsWith('http')
+            ? tab.href
+            : `${BASE_URL}${tab.href.startsWith('/') ? '' : '/game/'}${tab.href}`;
+          logger.debug(`[Scanner] Navigating to tab "${tab.text}": ${fullUrl}`);
+          await goto(page, fullUrl);
+          await humanDelay(700, 1400);
+          if (!page.url().includes('empire')) {
+            logger.warn(`[Scanner] Tab "${tab.text}" navigated away from empire — skipping`);
+            await goto(page, `${BASE_URL}/game/index.php?page=standalone&component=empire`);
+            await humanDelay(800, 1500);
+            continue;
+          }
+        } else {
+          // JS-driven tab: use Playwright click
+          logger.debug(`[Scanner] Clicking JS tab "${tab.text}"`);
+          const tabEl = await page.$(`#empireTab a:nth-of-type(${tab.index + 1}), #empireTab button:nth-of-type(${tab.index + 1})`).catch(() => null);
+          if (!tabEl) continue;
+          await tabEl.click();
+          await humanDelay(400, 800);
+          // If clicking navigated away, restore and stop tab iteration
+          if (!page.url().includes('empire')) {
+            logger.warn(`[Scanner] Tab click navigated away — restoring empire page`);
+            await goto(page, `${BASE_URL}/game/index.php?page=standalone&component=empire`);
+            await humanDelay(800, 1500);
+            break;
+          }
+        }
+
+        // Wait for [data-technology] rows to appear after tab switch
+        await page.waitForSelector('[data-technology]', { timeout: 8000 }).catch(() => null);
+        await maybeScroll(page, 0.3);
+
+        const tabResult = await _scrapeVisibleEmpireTab(page);
+        if (tabResult) {
+          const techCount = Object.values(tabResult.data).reduce(
+            (s, d) => s + Object.keys(d.buildings).length + Object.keys(d.fleet).length + Object.keys(d.defense).length, 0
+          );
+          logger.debug(`[Scanner] Tab "${tab.text}": ${tabResult.planets.length} planets, ${techCount} tech values`);
+          _mergeTabData(mergedData, tabResult);
+        }
+
+        await maybeDistract(0.05);
+        await humanDelay(300, 700);
+      }
+    }
+
+    // ── Validate ──────────────────────────────────────────────────────────────
+    const snapshotCount = Object.keys(mergedData).length;
+
+    if (snapshotCount < 2) {
+      const domHint = await page.evaluate(() => {
+        const empireEls = Array.from(document.querySelectorAll('[id*="empire"],[class*="empire"]'))
+          .slice(0, 8)
+          .map(e => `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''}${e.className ? '.' + String(e.className).split(/\s+/).slice(0, 2).join('.') : ''}`);
+        const techCount = document.querySelectorAll('[data-technology]').length;
+        const tables    = Array.from(document.querySelectorAll('table')).slice(0, 4)
+          .map(t => `table${t.id ? '#' + t.id : ''}(${t.rows.length}rows)`);
+        return { empireEls, techCount, tables, url: location.href };
+      }).catch(() => ({}));
+
+      logger.warn(`[Scanner] Empire parse failed — got ${snapshotCount} planets from ${tabInfo.length} tabs`);
+      logger.warn(`[Scanner] techElements=${domHint.techCount}  empireEls: ${domHint.empireEls?.join(' | ')}`);
+      if (domHint.tables?.length) logger.warn(`[Scanner] Tables: ${domHint.tables.join(' | ')}`);
       logger.warn('[Scanner] Falling back to per-planet scan');
       return null;
     }
 
-    logger.info(`[Scanner] Empire page: layout=${empireData.layout} planets=${empireData.planets.length}`);
+    logger.info(`[Scanner] Empire scan complete — ${snapshotCount} planets across ${tabInfo.length} tab(s)`);
 
-    // ── Merge empire data with known planet list ─────────────────────────────
-    // The planets array from getPlanets() has IDs + cp params we need later.
-    // We match by coords (most reliable cross-reference).
-    const snapshots = empireData.planets.map(emp => {
-      // Try to match to a known planet by coordinates
+    // ── Build snapshots from mergedData ──────────────────────────────────────
+    const snapshots = Object.values(mergedData).map(emp => {
       const known = planets?.find(p => p.coords && emp.coords && p.coords === emp.coords);
-
       const planet = known ?? {
-        name:    emp.name,
-        coords:  emp.coords,
-        id:      emp.planetId,
-        isMoon:  emp.isMoon,
-        isHome:  false,
+        name:   emp.name,
+        coords: emp.coords,
+        id:     emp.planetId,
+        isMoon: emp.isMoon,
+        isHome: false,
       };
 
       logger.info(
         `[Scanner] ${planet.coords || emp.coords}: ` +
         `M=${emp.resources?.metal ?? '?'} C=${emp.resources?.crystal ?? '?'} ` +
         `D=${emp.resources?.deuterium ?? '?'} E=${emp.energy ?? 0} ` +
-        `buildings=${Object.keys(emp.buildings || {}).length} ` +
+        `bldg=${Object.keys(emp.buildings || {}).length} ` +
         `fleet=${Object.keys(emp.fleet || {}).length} ` +
-        `defense=${Object.keys(emp.defense || {}).length}`
+        `def=${Object.keys(emp.defense || {}).length}`
       );
 
       return {
         planet,
-        resources: emp.resources ?? {},
-        energy:    emp.energy    ?? 0,
-        buildings: emp.buildings ?? {},
-        fleet:     emp.fleet     ?? {},
-        defense:   emp.defense   ?? {},
+        resources:  emp.resources  ?? {},
+        energy:     emp.energy     ?? 0,
+        buildings:  emp.buildings  ?? {},
+        fleet:      emp.fleet      ?? {},
+        defense:    emp.defense    ?? {},
         scannedVia: 'empire',
       };
     });
 
-    logger.info(`[Scanner] Empire scan complete — ${snapshots.length} planets`);
     return snapshots;
 
   } catch (err) {
