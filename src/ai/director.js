@@ -20,27 +20,48 @@ const SYSTEM_PROMPT = `\
 You are advising a player in OGame (browser space strategy game) on HOW to execute their command.
 Your role is strictly advisory — you must NOT substitute a different action for what the player asked.
 
-Given the player's directive and their current game state, return:
-1. The primary OGame tactic to use: "economics", "defense", "attacker", or "collector"
-2. Specific params for that tactic (e.g. which planets to target, what resources to move, how aggressive to be)
-3. A plain-English explanation of WHAT will happen when this executes
-4. Whether this is DESTRUCTIVE — meaning it would very likely destroy the player's fleet or severely damage their empire
-   (only flag as destructive for clear catastrophic risks: attacking a planet with 10x stronger defense than our fleet)
-5. If destructive, a brief reason why
+AVAILABLE TOOLS:
 
-Respond ONLY with valid JSON — no markdown:
-{
-  "tactic": "attacker" | "economics" | "defense" | "collector",
-  "params": {
-    "preferNearby": true | false,
-    "aggressiveness": "conservative" | "normal" | "aggressive",
-    "buildTarget": "Building Name or null",
-    "notes": "any extra execution notes"
-  },
-  "explanation": "≤60-word plain English: what the agent will do to carry out this command",
-  "destructive": false,
-  "destructiveReason": "null or brief reason why this is risky"
-}`;
+TOOL 1: interpret_directive(tactic, params, explanation, destructive, destructiveReason)
+- tactic: "economics" | "defense" | "attacker" | "collector"
+- params: object with preferNearby (bool), aggressiveness ("conservative"|"normal"|"aggressive"), buildTarget (string|null), notes (string)
+- explanation: ≤ 60-word plain English of what the agent will do
+- destructive: boolean — true only for clear catastrophic risks
+- destructiveReason: null or brief reason why this is risky
+
+CALL THE TOOL with your interpretation. Return ONLY one tool call matching the player's directive intent.`;
+
+// ── Tool Call Parsing ────────────────────────────────────────────────────────
+
+function parseToolCalls(response) {
+  const result = {
+    tactic: 'economics',
+    params:   { preferNearby: true, aggressiveness: 'normal', buildTarget: null, notes: '' },
+    explanation: '',
+    destructive: false,
+    destructiveReason: null,
+  };
+
+  const tools = response.choices?.[0]?.message?.tool_calls ?? [];
+  
+  for (const toolCall of tools) {
+    const func = toolCall.function;
+    const name = func.name;
+    const args = JSON.parse(func.arguments);
+
+    if (name === 'interpret_directive') {
+      result.tactic = args.tactic || 'economics';
+      result.params = args.params || { preferNearby: true, aggressiveness: 'normal', buildTarget: null, notes: '' };
+      result.explanation = args.explanation || '';
+      result.destructive = !!args.destructive;
+      result.destructiveReason = args.destructiveReason || null;
+    }
+  }
+
+  return result;
+}
+
+// ── Main API ──────────────────────────────────────────────────────────────────
 
 /**
  * Interpret a player directive into a concrete execution plan.
@@ -81,19 +102,58 @@ async function interpretDirective(directiveText, snapshots = []) {
 
     logger.info(`[Director] Interpreting directive: "${directiveText}"`);
 
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "interpret_directive",
+          description: "Interpret a player directive into specific OGame tactic and parameters. Returns the recommended execution approach.",
+          parameters: {
+            type: "object",
+            properties: {
+              tactic:         { type: "string", enum: ["economics", "defense", "attacker", "collector"] },
+              params:         {
+                type: "object",
+                properties: {
+                  preferNearby:  { type: "boolean" },
+                  aggressiveness:{ 
+                    type: "string", 
+                    enum: ["conservative", "normal", "aggressive"] 
+                  },
+                  buildTarget:   { type: ["string", "null"], nullable: true },
+                  notes:         { type: "string" }
+                },
+                required: ["preferNearby", "aggressiveness", "buildTarget", "notes"]
+              },
+              explanation:     { 
+                type: "string", 
+                description: "Plain English explanation of what the agent will do (≤ 60 words)" 
+              },
+              destructive:     { type: "boolean" },
+              destructiveReason:{ 
+                type: ["string", "null"], 
+                nullable: true,
+                description: "Brief reason why this is risky, or null if not destructive"
+              }
+            },
+            required: ["tactic", "params", "explanation", "destructive", "destructiveReason"]
+          }
+        }
+      }
+    ];
+
     const response = await client.chat.completions.create({
       model:       MODEL,
       max_tokens:  300,
       temperature: 0.3,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user',   content: `Game state:\n${JSON.stringify(context, null, 2)}\n\nPlayer directive: "${directiveText}"\n\nHow should the agent execute this?` },
+        { role: 'user',   content: `Game state:\n${JSON.stringify(context, null, 2)}\n\nPlayer directive: "${directiveText}"\n\nCall interpret_directive with your analysis.` },
       ],
-      response_format: { type: 'json_object' },
+      tools: tools,
     });
 
-    const raw = response.choices[0]?.message?.content ?? '{}';
-    const result = JSON.parse(raw);
+    const result = parseToolCalls(response);
 
     logger.info(`[Director] Interpretation: tactic=${result.tactic} destructive=${result.destructive}`);
     logger.info(`[Director] Plan: ${result.explanation}`);

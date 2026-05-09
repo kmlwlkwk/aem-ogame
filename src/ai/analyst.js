@@ -30,14 +30,23 @@ You are an expert OGame strategy advisor embedded in an automated agent.
 The agent manages a planet on OGame server s261 (Polish).
 
 You will receive a structured JSON snapshot of the current game state.
-Your job is to return a JSON object telling the agent how to prioritise
-its tactics for the next cycle.
+Your job is to return tactical recommendations by calling available tools.
 
-AVAILABLE TACTICS — you MUST use ONLY these exact strings:
-  "economics"  — upgrades mines, facilities, and the research queue
-  "defense"    — builds planetary defence units (launchers → domes)
-  "collector"  — upgrades resource mines based on ROI
-  "attacker"   — raids INACTIVE players only (espionage-gated, safe targets)
+AVAILABLE TOOLS:
+
+TOOL 1: set_tactic_order(economics, defense, collector, attacker)
+- Arrange tactics in priority order for this cycle
+- Each argument must be one of: "economics", "defense", "collector", "attacker"
+- All four tactics must appear exactly once in the call
+
+TOOL 2: skip_tactics(economics|defense|collector|attacker|null)
+- Skip a specific tactic this cycle (pass null if none to skip)
+- Use only when absolutely necessary due to game state constraints
+
+TOOL 3: flag_urgent_action(tactic, reason)
+- Flag an urgent action that must be prioritized above all else
+- tactic: "economics" | "defense" | "collector" | "attacker"
+- reason: brief explanation (≤ 50 chars)
 
 RULES (non-negotiable):
   - NEVER include or recommend attacking active players.
@@ -47,19 +56,118 @@ RULES (non-negotiable):
   - Prioritise long-term survival and economy over aggression.
   - "attacker" should be last unless there is a clear profitable target.
 
-Respond ONLY with valid JSON — no markdown, no extra text:
-{
-  "tacticOrder":   string[],   // all four exact tactic strings in recommended order
-  "skipTactics":   string[],   // tactics to skip this cycle (use [] if none)
-  "urgentAction":  { "tactic": string, "reason": string } | null,
-  "advice":        string,     // ≤ 80-word plain English summary
-  "confidence":    number      // 0.0–1.0
-}`;
+Call set_tactic_order as your primary recommendation. Call other tools only if specific conditions apply.`;
 
-// ── AI call (text-only — vision not supported by this endpoint) ───────────────
+// ── Tool Call Parsing for consult() ───────────────────────────────────────────
+
+function parseConsultTools(response) {
+  const result = {
+    tacticOrder:  ['economics', 'defense', 'collector', 'attacker'],
+    skipTactics:  [],
+    urgentAction: null,
+    advice:       'Using default tactic order (AI not consulted this cycle).',
+    confidence:   1.0,
+  };
+
+  const tools = response.choices?.[0]?.message?.tool_calls ?? [];
+  
+  for (const toolCall of tools) {
+    const func = toolCall.function;
+    const name = func.name;
+    const args = JSON.parse(func.arguments);
+
+    if (name === 'set_tactic_order') {
+      // Extract from function arguments — should be all four tactics
+      result.tacticOrder = [args.economics, args.defense, args.collector, args.attacker].filter(Boolean);
+    } else if (name === 'skip_tactics' && args) {
+      const skipped = ['economics', 'defense', 'collector', 'attacker'];
+      if (skipped.includes(args)) {
+        result.skipTactics.push(args);
+      }
+    } else if (name === 'flag_urgent_action') {
+      result.urgentAction = { tactic: args.tactic, reason: args.reason };
+    }
+  }
+
+  // Generate advice from tool calls
+  const reasons = [
+    ...result.skipTactics.map(s => `Skipping ${s}`),
+    ...(result.urgentAction ? [`Urgent: ${result.urgentAction.tactic} — ${result.urgentAction.reason}`] : [])
+  ];
+  result.advice = `AI analysis: ${reasons.join('; ') || 'Standard priority order.'}`;
+
+  return result;
+}
 
 async function askAI(gameState) {
   const stateJson = JSON.stringify(gameState, null, 2);
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "set_tactic_order",
+        description: "Set the priority order for tactics this cycle. Must include all four tactics exactly once.",
+        parameters: {
+          type: "object",
+          properties: {
+            economics:{ type: "string" },
+            defense:   { type: "string" },
+            collector: { type: "string" },
+            attacker:  { type: "string" }
+          },
+          required: ["economics", "defense", "collector", "attacker"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "skip_tactics",
+        description: "Skip a specific tactic this cycle. Pass null if no tactics to skip.",
+        parameters: {
+          type: "object",
+          properties: {
+            economics:{ 
+              type: "string", 
+              enum: ["economics", "defense", "collector", "attacker"] 
+            },
+            defense:   { 
+              type: "string", 
+              enum: ["economics", "defense", "collector", "attacker"] 
+            },
+            collector: { 
+              type: "string", 
+              enum: ["economics", "defense", "collector", "attacker"] 
+            },
+            attacker:  { 
+              type: "string", 
+              enum: ["economics", "defense", "collector", "attacker"] 
+            }
+          },
+          required: []
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "flag_urgent_action",
+        description: "Flag an urgent action that must be prioritized immediately.",
+        parameters: {
+          type: "object",
+          properties: {
+            tactic:{ 
+              type: "string", 
+              enum: ["economics", "defense", "collector", "attacker"] 
+            },
+            reason:  { type: "string", maxLength: 50 }
+          },
+          required: ["tactic", "reason"]
+        }
+      }
+    }
+  ];
 
   const response = await client.chat.completions.create({
     model:       MODEL,
@@ -67,13 +175,12 @@ async function askAI(gameState) {
     temperature: 0.2,
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user',   content: `Current game state:\n\`\`\`json\n${stateJson}\n\`\`\`\n\nReturn your JSON recommendation.` },
+      { role: 'user',   content: `Current game state:\n\`\`\`json\n${stateJson}\n\`\`\`\n\nCall set_tactic_order with your recommended priority sequence.` },
     ],
-    response_format: { type: 'json_object' },
+    tools,
   });
 
-  const raw = response.choices[0]?.message?.content ?? '{}';
-  return JSON.parse(raw);
+  return parseConsultTools(response);
 }
 
 // ── Default fallback ──────────────────────────────────────────────────────────
@@ -122,6 +229,30 @@ async function findElementWithAI(page, description) {
         .filter(el => el.text || el.id || el.dataTab);
     });
 
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "select_element",
+          description: "Identify the element that best matches the given description. Return idx of matching element or -1 if not found.",
+          parameters: {
+            type: "object",
+            properties: {
+              idx:    { 
+                type: "integer", 
+                description: "Element index from the provided list, or -1 if nothing matches" 
+              },
+              reason:{ 
+                type: "string", 
+                description: "Brief explanation of why this element (or lack thereof) was chosen" 
+              }
+            },
+            required: ["idx", "reason"]
+          }
+        }
+      }
+    ];
+
     const response = await client.chat.completions.create({
       model:       MODEL,
       max_tokens:  150,
@@ -132,18 +263,17 @@ async function findElementWithAI(page, description) {
           content:
             'You are an OGame UI expert. Given interactive DOM elements from an OGame page, ' +
             'identify which element best matches the description. ' +
-            'Return JSON: { "idx": number, "reason": string }. ' +
-            'idx must be the element\'s idx field. If nothing matches, return { "idx": -1, "reason": "not found" }.',
+            'Return JSON using tool_calling format with select_element tool.',
         },
         {
           role: 'user',
           content: `Looking for: ${description}\n\nPage URL contains: "${page.url().split('?')[1] ?? ''}"\n\nElements:\n${JSON.stringify(elements, null, 2)}`,
         },
       ],
-      response_format: { type: 'json_object' },
+      tools,
     });
 
-    const result = JSON.parse(response.choices[0]?.message?.content ?? '{"idx":-1}');
+    const result = parseElementTools(response);
     if (result.idx < 0 || result.idx >= elements.length) {
       logger.warn(`[AI] Element discovery: not found — ${result.reason}`);
       return { found: false };
@@ -165,6 +295,20 @@ async function findElementWithAI(page, description) {
   }
 }
 
+// ── Tool Call Parsing for findElementWithAI() ─────────────────────────────────
+
+function parseElementTools(response) {
+  const tools = response.choices?.[0]?.message?.tool_calls ?? [];
+  
+  if (tools.length > 0) {
+    const func = tools[0].function;
+    const args = JSON.parse(func.arguments);
+    return { idx: args.idx, reason: args.reason };
+  }
+
+  return { idx: -1, reason: 'no tool call — fallback to default' };
+}
+
 // ── Espionage target analysis ─────────────────────────────────────────────────
 
 /**
@@ -176,6 +320,31 @@ async function analyzeTarget(targetData) {
   if (!aiEnabled) return { attack: false, reason: 'AI disabled', confidence: 0 };
 
   try {
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "evaluate_attack_target",
+          description: "Evaluate whether attacking an inactive target is profitable and safe. Never recommend if defensePoints > 5000 or reportAgeHours > 6.",
+          parameters: {
+            type: "object",
+            properties: {
+              attack:     { type: "boolean" },
+              reason:     { 
+                type: "string", 
+                description: "Brief explanation of why this target is recommended or not" 
+              },
+              confidence: { 
+                type: "number", 
+                description: "Confidence in the evaluation (0.0-1.0)" 
+              }
+            },
+            required: ["attack", "reason", "confidence"]
+          }
+        }
+      }
+    ];
+
     const response = await client.chat.completions.create({
       model:       MODEL,
       max_tokens:  120,
@@ -187,23 +356,37 @@ async function analyzeTarget(targetData) {
             'You are an OGame combat strategist. Evaluate whether attacking this inactive target is profitable and safe. ' +
             'Consider: resources vs fleet cost, defense level, report age. ' +
             'NEVER recommend attacking if defensePoints > 5000 or reportAgeHours > 6. ' +
-            'Return JSON: { "attack": boolean, "reason": string, "confidence": number }',
+            'Call the evaluate_attack_target tool with your recommendation.',
         },
         {
           role: 'user',
           content: `Target data:\n${JSON.stringify(targetData, null, 2)}`,
         },
       ],
-      response_format: { type: 'json_object' },
+      tools,
     });
 
-    const result = JSON.parse(response.choices[0]?.message?.content ?? '{"attack":false}');
+    const result = parseTargetTools(response);
     logger.info(`[AI] Target ${targetData.coords}: attack=${result.attack} — ${result.reason}`);
     return result;
   } catch (err) {
     logger.warn(`[AI] Target analysis failed: ${err.message}`);
     return { attack: false, reason: 'AI error', confidence: 0 };
   }
+}
+
+// ── Tool Call Parsing for analyzeTarget() ─────────────────────────────────────
+
+function parseTargetTools(response) {
+  const tools = response.choices?.[0]?.message?.tool_calls ?? [];
+  
+  if (tools.length > 0) {
+    const func = tools[0].function;
+    const args = JSON.parse(func.arguments);
+    return { attack: !!args.attack, reason: args.reason, confidence: args.confidence || 0 };
+  }
+
+  return { attack: false, reason: 'no tool call — default to no attack', confidence: 0 };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

@@ -19,7 +19,28 @@ const SYSTEM_PROMPT = `\
 You are an expert OGame strategist managing a multi-planet empire on server s261 (English).
 You receive a JSON snapshot of ALL planets with their resources, building levels, fleet, and energy.
 
-Your job is to produce a strategic build plan that maximises long-term economic growth and defense.
+Your job is to produce strategic recommendations by calling the available tools.
+
+AVAILABLE TOOLS — call each tool with parameters that match the requirements below:
+
+TOOL 1: plan_planet(coords, buildNext, buildId, reason, urgent)
+- Recommend a specific building construction on a planet
+- coords: "G:S:P" format
+- buildNext: full building name (e.g., "Metal Mine")
+- buildId: OGame tech ID number
+- reason: brief explanation (≤ 50 chars)
+- urgent: true only if energy is critically low or queue can afford it
+
+TOOL 2: move_transport(from, to, metal, crystal, deuterium, reason)
+- Recommend resource transport between planets
+- from/to: "G:S:P" format
+- metal/crystal/deuterium: amounts to transfer (0 if none)
+- reason: why this transport is beneficial (≤ 50 chars)
+
+TOOL 3: recommend_research(techName, priority)
+- Recommend a global research investment
+- techName: full technology name or null
+- priority: "high" | "normal" | "low"
 
 KEY RULES:
 - Buildings listed under "buildings" use OGame technology IDs (1=Metal Mine, 2=Crystal Mine, 3=Deut Synthesizer, 4=Solar Plant, 12=Metal Storage, 13=Crystal Storage, 14=Deuterium Tank, 21=Robotics Factory, 22=Missile Silo, 23=Research Lab, 15=Shipyard, 31=Lunar Base, 33=Sensor Phalanx, 34=Jump Gate)
@@ -30,31 +51,7 @@ KEY RULES:
 - Transport ships: Large Cargo (id=203) carries 25000 units each — check fleet before recommending transport
 - If a planet queue is busy, recommend the NEXT build not the current one
 
-Respond ONLY with valid JSON — no markdown:
-{
-  "planetActions": [
-    {
-      "coords": "G:S:P",
-      "buildNext": "Building Name",
-      "buildId": N,
-      "reason": "short reason",
-      "urgent": false
-    }
-  ],
-  "transports": [
-    {
-      "from": "G:S:P",
-      "to": "G:S:P",
-      "metal": N,
-      "crystal": N,
-      "deuterium": N,
-      "reason": "short reason"
-    }
-  ],
-  "researchNext": "Tech Name or null",
-  "advice": "≤80-word strategic summary",
-  "confidence": 0.0-1.0
-}`;
+Call tools only when you have a concrete recommendation. If no action needed for a category, omit that tool call.`;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -69,6 +66,48 @@ function summariseSnapshot(snap) {
     fleet:     snap.fleet,          // { shipId: count }
     defense:   snap.defense,        // { defId: count }
   };
+}
+
+// ── Tool Call Parsing ────────────────────────────────────────────────────────
+
+/**
+ * Parse tool calls from AI response and convert to structured plan object.
+ */
+function parseToolCalls(response) {
+  const plan = {
+    planetActions: [],
+    transports: [],
+    researchNext: null,
+    advice: '',
+    confidence: 0.5,
+  };
+
+  const tools = response.choices?.[0]?.message?.tool_calls ?? [];
+  
+  for (const toolCall of tools) {
+    const func = toolCall.function;
+    const name = func.name;
+    const args = JSON.parse(func.arguments);
+
+    if (name === 'plan_planet') {
+      plan.planetActions.push(args);
+    } else if (name === 'move_transport') {
+      plan.transports.push(args);
+    } else if (name === 'recommend_research') {
+      if (args.techName && args.priority !== 'low') {
+        plan.researchNext = `${args.techName} (${args.priority})`;
+      }
+    }
+  }
+
+  // Extract advice from tool call reason fields or use default
+  const allReasons = [
+    ...(plan.planetActions?.map(a => a.reason) ?? []),
+    ...(plan.transports?.map(t => t.reason) ?? [])
+  ];
+  plan.advice = `Plan: ${allReasons.length} recommendations. Prioritise economy and energy.`;
+
+  return plan;
 }
 
 // ── Main API ──────────────────────────────────────────────────────────────────
@@ -96,24 +135,75 @@ async function strategize(snapshots) {
 
     logger.info(`[Strategist] Requesting strategic plan for ${snapshots.length} planets …`);
 
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "plan_planet",
+          description: "Recommend a specific building construction on a planet. Use when you have identified what to build next.",
+          parameters: {
+            type: "object",
+            properties: {
+              coords:    { type: "string" },
+              buildNext: { type: "string" },
+              buildId:   { type: "integer" },
+              reason:    { type: "string" },
+              urgent:    { type: "boolean" }
+            },
+            required: ["coords", "buildNext", "buildId", "reason", "urgent"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "move_transport",
+          description: "Recommend a resource transport between planets. Use when source has surplus and target needs for specific builds.",
+          parameters: {
+            type: "object",
+            properties: {
+              from:     { type: "string" },
+              to:       { type: "string" },
+              metal:    { type: "integer" },
+              crystal:  { type: "integer" },
+              deuterium:{ type: "integer" },
+              reason:   { type: "string" }
+            },
+            required: ["from", "to", "metal", "crystal", "deuterium", "reason"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "recommend_research",
+          description: "Recommend a global research investment. Use once to identify priority tech.",
+          parameters: {
+            type: "object",
+            properties: {
+              techName:  { type: "string" },
+              priority:  { type: "string", enum: ["high", "normal", "low"] }
+            },
+            required: ["techName", "priority"]
+          }
+        }
+      }
+    ];
+
     const response = await client.chat.completions.create({
       model:       MODEL,
       max_tokens:  700,
       temperature: 0.2,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user',   content: `Planet snapshots:\n\`\`\`json\n${userMsg}\n\`\`\`\n\nReturn your strategic plan.` },
+        { role: 'user',   content: `Planet snapshots:\n${userMsg}\n\nCall tools with your strategic recommendations.` },
       ],
-      response_format: { type: 'json_object' },
+      tools: tools,
     });
 
-    const raw  = response.choices[0]?.message?.content ?? '{}';
-    const plan = JSON.parse(raw);
+    const plan = parseToolCalls(response);
 
-    if (!Array.isArray(plan.planetActions)) plan.planetActions = [];
-    if (!Array.isArray(plan.transports))    plan.transports    = [];
-
-    logger.info(`[Strategist] Plan ready: ${plan.planetActions.length} actions, ${plan.transports.length} transports. ${plan.advice ?? ''}`);
+    logger.info(`[Strategist] Plan ready: ${plan.planetActions.length} actions, ${plan.transports.length} transports. ${plan.advice}`);
 
     return plan;
   } catch (err) {
