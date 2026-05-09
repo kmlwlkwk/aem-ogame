@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Environment — NEVER commit this, it contains your credentials and API keys
+.env
+
+# Session — saved login cookies, personal to your account
+session.json
+
+# SQLite database — runtime data, regenerated on each run
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# Debug screenshots captured on errors/crashes
+*.png
+!docs/**/*.png
+
+# Tesseract OCR training data — large binary, see README for download
+*.traineddata
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
