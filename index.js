@@ -18,6 +18,13 @@ async function main() {
   if (USE_TUI) {
     // Start TUI — it takes over stdout, so do this before any log output
     tui.init((commandText) => {
+      // Vim-style quit shortcuts (:q  :quit  :exit)
+      if (/^:q(uit)?$|^:exit$/i.test(commandText.trim())) {
+        tui.log('{red-fg}[Commander] ⚔  Standing down… farewell, Commander. o7{/red-fg}');
+        setTimeout(() => process.emit('SIGINT'), 300);
+        return;
+      }
+
       // Slash commands are consumed immediately — no directive system involved
       if (handleSlash(commandText, tui)) return;
 

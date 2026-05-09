@@ -47,10 +47,12 @@ const HELP = [
   '{cyan-fg}│{/cyan-fg}  {bold}/pause{/bold}                Pause agent after current cycle',
   '{cyan-fg}│{/cyan-fg}  {bold}/resume{/bold}               Resume paused agent',
   '{cyan-fg}│{/cyan-fg}  {bold}/version{/bold}              Show version info',
+  '{cyan-fg}│{/cyan-fg}  {bold}/quit{/bold}  /exit  Ctrl+C  Graceful shutdown',
   '{cyan-fg}│{/cyan-fg}',
   '{cyan-fg}│{/cyan-fg}  Or just type naturally:  "attack nearby inactives"',
   '{cyan-fg}│{/cyan-fg}                           "build solar satellites"',
   '{cyan-fg}│{/cyan-fg}                           "force: destroy all solar plants"',
+  '{cyan-fg}│{/cyan-fg}  Vim-style: {bold}:q{/bold}  {bold}:quit{/bold}  also accepted',
   '{cyan-fg}└────────────────────────────────────────────────────┘{/cyan-fg}',
 ];
 
@@ -161,6 +163,14 @@ function handleSlash(input, tui) {
     // ── Version ─────────────────────────────────────────────────────────────
     case 'version':
       tuiLog(tui, `{cyan-fg}[Commander] ⚔  OGame Commander by Camillo  v${version}{/cyan-fg}`);
+      break;
+
+    // ── Quit ────────────────────────────────────────────────────────────────
+    case 'quit':
+    case 'exit':
+    case 'q':
+      tuiLog(tui, '{red-fg}[Commander] ⚔  Standing down… farewell, Commander. o7{/red-fg}');
+      setTimeout(() => process.emit('SIGINT'), 300);
       break;
 
     // ── Unknown ─────────────────────────────────────────────────────────────

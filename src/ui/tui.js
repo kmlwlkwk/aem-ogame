@@ -239,8 +239,8 @@ function init(onCommand) {
     inputBox.focus();
   });
 
-  // q / Ctrl-C to exit
-  screen.key(['q', 'C-c'], () => process.exit(0));
+  // Ctrl-C triggers graceful shutdown (browser.close etc.) via index.js handler
+  screen.key('C-c', () => process.emit('SIGINT'));
 
   // Escape refocuses input
   screen.key('escape', () => inputBox.focus());
