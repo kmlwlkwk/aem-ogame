@@ -30,12 +30,29 @@
 
 ## Installation
 
+### macOS / Linux
+
 ```bash
 git clone https://github.com/you/ogame-commander.git
 cd ogame-commander
 npm install
 npx playwright install chromium
 ```
+
+### Windows
+
+1. Install [Node.js 18+](https://nodejs.org) (LTS recommended — includes npm)
+2. Install [Git for Windows](https://git-scm.com/download/win)
+3. Open **PowerShell** or **Windows Terminal** and run:
+
+```powershell
+git clone https://github.com/you/ogame-commander.git
+cd ogame-commander
+npm install
+npx playwright install chromium
+```
+
+> **Note:** The interactive TUI requires a proper terminal. Use **Windows Terminal** (available free from the Microsoft Store) — the old `cmd.exe` doesn't render it correctly. If you can't use Windows Terminal, add `NO_TUI=true` to your `.env` to fall back to plain console output.
 
 ### CAPTCHA support (optional)
 
@@ -44,10 +61,13 @@ The agent can solve drag-slider CAPTCHAs using Tesseract OCR. Download the Polis
 ```bash
 # macOS
 brew install tesseract
-# Then download the traineddata for your language:
-# https://github.com/tesseract-ocr/tessdata
-# Place pol.traineddata in the project root (already in .gitignore)
+
+# Windows — download the installer from:
+# https://github.com/UB-Mannheim/tesseract/wiki
+# During install, check the language pack for your server language (e.g. Polish)
 ```
+
+Then download the `.traineddata` file for your language from [tessdata](https://github.com/tesseract-ocr/tessdata) and place it in the project root (already in `.gitignore`).
 
 ---
 
@@ -87,8 +107,9 @@ npm start
 # Watch the browser too
 npm run start:headed
 
-# Plain console output (no TUI — for piping/logging)
-NO_TUI=true npm start
+# Plain console output (no TUI — for piping/logging, or Windows cmd.exe)
+NO_TUI=true npm start        # macOS / Linux
+$env:NO_TUI="true"; npm start   # Windows PowerShell
 ```
 
 ---
