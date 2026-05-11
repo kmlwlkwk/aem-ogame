@@ -27,12 +27,60 @@ const { gotoComponent, readResources, withRetry, BASE_URL } = require('../utils/
 const DEFENSE_SAFE_THRESHOLD = parseInt(process.env.DEFENSE_SAFE_THRESHOLD ?? '5000', 10);
 const ESPIONAGE_MIN_LEVEL    = parseInt(process.env.ESPIONAGE_MIN_LEVEL    ?? '5',    10);
 const REPORT_MAX_AGE_H       = 6;    // ignore reports older than 6 hours
-const PROBE_RANGE            = 4;    // scan ±N systems around home for inactives
+
+// ── Scanning strategy configuration ───────────────────────────────────────────
+const SCAN_MODE      = (process.env.ATTACK_SCAN_MODE     ?? 'standard').trim().toLowerCase();
+const PROBE_RANGE    = parseInt(process.env.ATTACK_PROBE_RANGE        ?? '4', 10);
+
+// Random mode: "MAX_PICKS,MAX_DISTANCE" e.g., "6,500" means 6 random picks in range 1-500
+const RANDOM_SYSTEMS_RANGE= process.env.ATTACK_RANDOM_SYSTEMS_RANGE    ?? '6,500';
+
+function parseRandomRange() {
+  const [maxPicks, maxDistance] = RANDOM_SYSTEMS_RANGE.split(',').map(s => s.trim());
+  return {
+    MAX_RANDOM_PICKS: parseInt(maxPicks, 10) || MAX_PROBES_PER_CYCLE,
+    SCANNER_MAX_DIST: parseInt(maxDistance, 10) || 500
+  };
+}
+
+// ── Probe dispatch limits ─────────────────────────────────────────────────────
 const MAX_PROBES_PER_CYCLE   = 6;    // max probe dispatches in one cycle
 const PROBES_PER_TARGET      = Math.max(ESPIONAGE_MIN_LEVEL, 3); // probes to send per target
 
-// Minimum loot-to-fleet-cost ratio before attacking
-const MIN_PROFIT_RATIO = 1.5;
+// ── Validation helpers ────────────────────────────────────────────────────────
+
+function validateScanMode() {
+  if (SCAN_MODE !== 'standard' && SCAN_MODE !== 'random') {
+    logger.warn(`[Attacker] Invalid SCAN_MODE "${SCAN_MODE}" — falling back to "standard"`);
+    SCAN_MODE = 'standard';
+  }
+}
+
+// ── Public API for scanning logic ──────────────────────────────────────────────
+
+/**
+ * Scan galaxy and return inactive planet candidates.
+ *
+ * Mode "standard": Scans ±PROBE_RANGE systems around home planet (deterministic radius)
+ * Mode "random": Picks up to MAX_RANDOM_PICKS random locations in 1–SCANNER_MAX_DIST range
+ */
+async function findInactiveCandidates(page, homeCoords) {
+  validateScanMode();
+
+  const [g, sys] = homeCoords.replace(/[\[\]]/g, '').split(':').map(Number);
+  if (!g || !sys) return [];
+
+  logger.info(`[Attacker] Scan mode: ${SCAN_MODE}`);
+
+  // Parse random range on first call (cached internally)
+  const { MAX_RANDOM_PICKS, SCANNER_MAX_DIST } = parseRandomRange();
+
+  if (SCAN_MODE === 'standard') {
+    return await scanStandardMode(page, g, sys);
+  } else {
+    return await scanRandomMode(page, MAX_RANDOM_PICKS, SCANNER_MAX_DIST);
+  }
+}
 
 // Light Fighter stats (used for fleet cost estimate)
 const LF_COST = { metal: 3000, crystal: 1000, deut: 0 };
@@ -189,31 +237,32 @@ async function scanSystemForInactives(page, galaxy, system) {
   });
 }
 
+// ── Standard mode: deterministic radius scan around home planet ───────────────
+
 /**
- * Scan PROBE_RANGE systems around homeCoords for inactive planets.
+ * Scan ±PROBE_RANGE systems around home planet for inactive planets.
  * Returns candidates sorted by distance (nearest first), capped at MAX_PROBES_PER_CYCLE.
  */
-async function findNearbyInactives(page, homeCoords) {
-  const [g, sys] = homeCoords.replace(/[\[\]]/g, '').split(':').map(Number);
-  if (!g || !sys) return [];
-
+async function scanStandardMode(page, galaxy, homeSys) {
   const candidates = [];
   const MAX_SYSTEMS = 499;
 
+  logger.info(`[Attacker] Standard mode: scanning systems [${1}-${MAX_SYSTEMS}] around ${galaxy}:${homeSys}`);
+
   for (let offset = 0; offset <= PROBE_RANGE; offset++) {
     const systemsToScan = offset === 0
-      ? [sys]
-      : [...new Set([Math.max(1, sys - offset), Math.min(MAX_SYSTEMS, sys + offset)])];
+      ? [homeSys]
+      : [...new Set([Math.max(1, homeSys - offset), Math.min(MAX_SYSTEMS, homeSys + offset)])];
 
     for (const s of systemsToScan) {
       try {
-        const inactives = await scanSystemForInactives(page, g, s);
+        const inactives = await scanSystemForInactives(page, galaxy, s);
         for (const coords of inactives) {
-          candidates.push({ coords, distance: Math.abs(s - sys) });
+          candidates.push({ coords, distance: Math.abs(s - homeSys) });
         }
         await humanDelay(300, 700);
       } catch (err) {
-        logger.debug(`[Attacker] Galaxy scan ${g}:${s} error: ${err.message}`);
+        logger.debug(`[Attacker] Galaxy scan ${galaxy}:${s} error: ${err.message}`);
       }
     }
 
@@ -221,6 +270,62 @@ async function findNearbyInactives(page, homeCoords) {
   }
 
   candidates.sort((a, b) => a.distance - b.distance);
+  logger.info(`[Attacker] Standard mode found ${candidates.length} inactive planet(s)`);
+  return candidates.slice(0, MAX_PROBES_PER_CYCLE);
+}
+
+// ── Random mode: stochastic scan across galaxy ───────────────────────────────
+
+/**
+ * Pick up to maxPicks random systems in the galaxy (1–maxDistance)
+ * and scan for inactive planets. Returns candidates capped at MAX_PROBES_PER_CYCLE.
+ */
+async function scanRandomMode(page, maxPicks, maxDistance = 500) {
+  const candidates = [];
+
+  logger.info(`[Attacker] Random mode: picking ${maxPicks} random systems in [1-${maxDistance}]`);
+
+  // Generate unique random system combinations across the entire galaxy
+  const visitedSystems = new Set();
+  const maxAttempts = maxPicks * 5; // Retry if collisions occur
+
+  for (let attempt = 0; attempt < maxAttempts && candidates.length < MAX_PROBES_PER_CYCLE; attempt++) {
+    // Pick random galaxy (1–100) and system (1-maxDistance)
+    const randomGalaxy = Math.floor(Math.random() * 100) + 1;
+    const randomSystem = Math.floor(Math.random() * maxDistance) + 1;
+    const key = `${randomGalaxy}:${randomSystem}`;
+
+    // Skip if already scanned this cycle
+    if (visitedSystems.has(key)) continue;
+
+    try {
+      const inactives = await scanSystemForInactives(page, randomGalaxy, randomSystem);
+      
+      for (const coords of inactives) {
+        // Parse coordinates to calculate distance from home (optional metric)
+        const [cg, cs] = coords.split(':')[0].split(':').map(Number);
+        const distance = Math.sqrt(Math.pow(cg - 47, 2) + Math.pow(cs - maxDistance/2, 2));
+        
+        candidates.push({ 
+          coords, 
+          distance: Math.round(distance * 10) / 10, // Distance in "galaxy units"
+          randomPick: true 
+        });
+      }
+
+      visitedSystems.add(key);
+      
+      if (candidates.length > 0) {
+        logger.debug(`[Attacker] Random pick ${randomGalaxy}:${randomSystem}: found ${inactives.length} inactive(s)`);
+      }
+    } catch (err) {
+      // Silent fail on random scans — they're meant to be exploratory
+    }
+
+    await humanDelay(300, 500); // Brief pause between random picks
+  }
+
+  logger.info(`[Attacker] Random mode: scanned ${visitedSystems.size} systems, found ${candidates.length} inactive(s)`);
   return candidates.slice(0, MAX_PROBES_PER_CYCLE);
 }
 
@@ -291,15 +396,15 @@ async function dispatchProbe(page, coords) {
 }
 
 /**
- * Probe nearby inactive planets when we have no espionage reports.
+ * Probe inactive planets when we have no espionage reports.
  * Returns the number of probes successfully sent.
  */
 async function probeNearbyInactives(page, homeCoords) {
-  logger.info(`[Attacker] 🗺️  Scanning galaxy for inactive targets near ${homeCoords}…`);
-  const candidates = await findNearbyInactives(page, homeCoords);
+  logger.info(`[Attacker] 🗺️  Scanning galaxy for inactive targets at ${homeCoords}…`);
+  const candidates = await findInactiveCandidates(page, homeCoords);
 
   if (!candidates.length) {
-    logger.info('[Attacker] No inactive planets found in nearby systems');
+    logger.info('[Attacker] No inactive planets found in scan area');
     return 0;
   }
 
@@ -479,4 +584,10 @@ async function run(page, opts = {}) {
   logger.info('━━ [Attacker] tactic end ━━');
 }
 
-module.exports = { run, collectTargets };
+// ── Public API ────────────────────────────────────────────────────────────────
+
+module.exports = { 
+  run,              // Main entry point for attacker tactic
+  collectTargets,   // Collect targets from espionage messages
+  findInactiveCandidates  // Get inactive planet candidates (standard or random mode)
+};
