@@ -247,7 +247,10 @@ async function scanStandardMode(page, galaxy, homeSys) {
   const candidates = [];
   const MAX_SYSTEMS = 499;
 
-  logger.info(`[Attacker] Standard mode: scanning systems [${1}-${MAX_SYSTEMS}] around ${galaxy}:${homeSys}`);
+  const scanStart = Math.max(1, homeSys - PROBE_RANGE);
+  const scanEnd = Math.min(MAX_SYSTEMS, homeSys + PROBE_RANGE);
+  
+  logger.info(`[Attacker] Standard mode: scanning systems [${scanStart}-${scanEnd}] around ${galaxy}:${homeSys}`);
 
   for (let offset = 0; offset <= PROBE_RANGE; offset++) {
     const systemsToScan = offset === 0
